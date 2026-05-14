@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         pay_mena Ticket Reporter
 // @namespace    http://tampermonkey.net/
-// @version      7.0
-// @description  Сбор и выгрузка тикетов агентов pay_mena в XLSX
+// @version      12.0
+// @description  pay_mena — прямые API запросы, X-Requested-With fix, retry, диагностика
 // @match        *://th-managment.com/*
 // @match        *://*.th-managment.com/*
 // @match        *://webmanegment.com/*
@@ -15,9 +15,6 @@
 (function () {
   'use strict';
 
-  // ============================================================
-  // КОНФИГ
-  // ============================================================
   var AGENTS = {
     'pay_mena_63':'Жанат Мейржан','pay_mena_106':'Шаймарданов Мадияр','pay_mena_110':'Айтбатыр Айжан',
     'pay_mena_116':'Кадиров Марлен','pay_mena_141':'Дарвакулов Дильмурат','pay_mena_184':'Чугункова Ульяна',
@@ -45,706 +42,562 @@
     'pay_mena_671':'Мифтахова Айгуль','pay_mena_681':'Якубов Максад','pay_mena_682':'Кадаев Ильдар'
   };
 
-  var INTERVAL_GREEN       = 50;
-  var INTERVAL_YELLOW      = 60;
-  var BREAK_LIMIT_MS       = 60 * 60 * 1000;
-  var MIN_INTERVAL_SHOW_MS = 5 * 60 * 1000;
-  var MODAL_WAIT_MS        = 3000;
-  var AFTER_CLOSE_MS       = 300;
-  var PAGE_WAIT_MS         = 2000;
+  var INTERVAL_GREEN   = 50;
+  var INTERVAL_YELLOW  = 60;
+  var BREAK_LIMIT_MS   = 60 * 60 * 1000;
+  var MIN_BREAK_SHOW   = 5 * 60 * 1000;
+  var PAGE_WAIT_MS     = 1000;
+  var DELAY_MS         = 350;
+  var MAX_RETRIES      = 5;
+  var RETRY_DELAY_MS   = 3500;
 
-  // ============================================================
-  // СОСТОЯНИЕ
-  // ============================================================
   var state = {
-    agentLogin:  null,
-    agentName:   null,
-    shiftStart:  null,
-    shiftEnd:    null,
-    results:     [],
-    countryStat: {},
-    statusStat:  {},
-    currentPage: 1,
-    running:     false,
-    total:       0,
-    done:        0
+    agentLogin:null, agentName:null, shiftStart:null, shiftEnd:null,
+    results:[], countryStat:{}, statusStat:{},
+    currentPage:1, running:false, total:0, done:0, skipped:0,
+    dbg:false
   };
 
-  // ============================================================
-  // СТИЛИ
-  // ============================================================
+  var agentMode='auto', dateMode='auto';
+  var selectedLogin=null, parsedStart=null, parsedEnd=null;
+
+  var allLogins = Object.keys(AGENTS).sort(function(a,b){
+    return AGENTS[a].localeCompare(AGENTS[b],'ru');
+  });
+
   GM_addStyle([
-    /* ── Панель ── */
-    '#tm-panel{',
-    '  position:fixed;bottom:20px;right:20px;z-index:2147483647;',
-    '  width:380px;',
-    '  background:#0f1a2b;',
-    '  border:1px solid #1e3a5f;',
-    '  border-radius:14px;',
-    '  box-shadow:0 8px 32px rgba(0,0,0,.6);',
-    '  font-family:Arial,sans-serif;',
-    '  font-size:13px;',
-    '  color:#d0e8ff;',
-    '  overflow:hidden;',
-    '  transition:all .25s ease;',
-    '}',
-
-    /* свёрнутый режим */
-    '#tm-panel.collapsed #tm-body{display:none;}',
-    '#tm-panel.collapsed{width:200px;}',
-
-    /* ── Шапка ── */
-    '#tm-header{',
-    '  display:flex;align-items:center;justify-content:space-between;',
-    '  padding:11px 14px 10px;',
-    '  background:linear-gradient(90deg,#1a3a5c,#0f2540);',
-    '  border-bottom:1px solid #1e3a5f;',
-    '  cursor:pointer;user-select:none;',
-    '}',
-    '#tm-header-title{display:flex;align-items:center;gap:7px;font-weight:700;font-size:13px;color:#7ecfff;letter-spacing:.4px;}',
-    '#tm-header-title span.dot{width:8px;height:8px;border-radius:50%;background:#3fa;display:inline-block;flex-shrink:0;}',
-    '#tm-header-title span.dot.busy{background:#f93;}',
-    '#tm-toggle-btn{background:none;border:none;color:#5a8ab0;font-size:17px;cursor:pointer;line-height:1;padding:0;flex-shrink:0;}',
-    '#tm-toggle-btn:hover{color:#7ecfff;}',
-
-    /* ── Тело ── */
-    '#tm-body{padding:14px 14px 12px;}',
-
-    /* ── Секции ── */
-    '.tm-section{margin-bottom:10px;}',
-    '.tm-label{font-size:11px;color:#5a8ab0;font-weight:600;letter-spacing:.5px;text-transform:uppercase;margin-bottom:5px;}',
-
-    /* ── Агент ── */
-    '#tm-agent-wrap{position:relative;}',
-    '#tm-agent-search{',
-    '  width:100%;box-sizing:border-box;',
-    '  padding:8px 10px;',
-    '  border-radius:8px;border:1px solid #1e3a5f;',
-    '  background:#071426;color:#d0e8ff;font-size:12px;',
-    '  outline:none;transition:border-color .2s;',
-    '}',
-    '#tm-agent-search:focus{border-color:#2e75b6;}',
-    '#tm-agent-search::placeholder{color:#3a5a7a;}',
-    '#tm-agent-dropdown{',
-    '  position:absolute;top:calc(100% + 4px);left:0;right:0;',
-    '  background:#0d1f33;border:1px solid #1e3a5f;border-radius:8px;',
-    '  max-height:180px;overflow-y:auto;z-index:999;',
-    '  box-shadow:0 4px 16px rgba(0,0,0,.5);',
-    '  display:none;',
-    '}',
-    '#tm-agent-dropdown.open{display:block;}',
-    '.tm-drop-item{',
-    '  padding:7px 10px;cursor:pointer;font-size:12px;',
-    '  border-bottom:1px solid #132030;color:#b0d4f0;',
-    '  transition:background .15s;',
-    '}',
-    '.tm-drop-item:last-child{border-bottom:none;}',
-    '.tm-drop-item:hover,.tm-drop-item.active{background:#1a3a5c;color:#7ecfff;}',
-    '.tm-drop-item span.login{color:#4a7a9a;font-size:11px;margin-left:5px;}',
-    '#tm-agent-selected{',
-    '  margin-top:5px;padding:5px 10px;border-radius:6px;',
-    '  background:#0a2040;border:1px solid #2e75b6;',
-    '  font-size:12px;color:#7ecfff;display:none;',
-    '  display:flex;align-items:center;justify-content:space-between;',
-    '}',
-    '#tm-agent-selected.hidden{display:none;}',
-    '#tm-agent-clear{background:none;border:none;color:#5a8ab0;cursor:pointer;font-size:13px;padding:0;}',
-    '#tm-agent-clear:hover{color:#f55;}',
-
-    /* ── Дата ── */
-    '#tm-date-input{',
-    '  width:100%;box-sizing:border-box;',
-    '  padding:8px 10px;',
-    '  border-radius:8px;border:1px solid #1e3a5f;',
-    '  background:#071426;color:#d0e8ff;font-size:12px;',
-    '  outline:none;transition:border-color .2s;',
-    '}',
-    '#tm-date-input:focus{border-color:#2e75b6;}',
-    '#tm-date-input::placeholder{color:#3a5a7a;}',
-    '#tm-date-hint{font-size:10px;color:#3a6a8a;margin-top:4px;}',
-    '#tm-date-parsed{',
-    '  margin-top:5px;padding:5px 10px;border-radius:6px;',
-    '  background:#0a2040;border:1px solid #1e3a5f;',
-    '  font-size:11px;color:#5ab0d0;display:none;',
-    '}',
-    '#tm-date-parsed.ok{border-color:#2e75b6;color:#7ecfff;display:block;}',
-    '#tm-date-parsed.err{border-color:#8b2020;color:#f06060;display:block;}',
-
-    /* ── Кнопка ── */
-    '#tm-btn-start{',
-    '  width:100%;padding:10px;border:none;border-radius:8px;',
-    '  background:linear-gradient(135deg,#2e75b6,#1a5276);',
-    '  color:#fff;font-size:13px;font-weight:700;cursor:pointer;',
-    '  letter-spacing:.4px;transition:opacity .2s,transform .1s;',
-    '  margin-top:4px;',
-    '}',
-    '#tm-btn-start:hover:not(:disabled){opacity:.9;transform:translateY(-1px);}',
-    '#tm-btn-start:active:not(:disabled){transform:translateY(0);}',
-    '#tm-btn-start:disabled{opacity:.4;cursor:not-allowed;}',
-
-    /* ── Прогресс ── */
-    '#tm-progress-wrap{',
-    '  margin-top:10px;background:#071426;border-radius:6px;',
-    '  overflow:hidden;height:6px;display:none;',
-    '}',
-    '#tm-progress-bar{',
-    '  height:100%;width:0%;',
-    '  background:linear-gradient(90deg,#2e75b6,#7ecfff);',
-    '  transition:width .3s ease;',
-    '}',
-
-    /* ── Статус ── */
-    '#tm-status{',
-    '  margin-top:8px;font-size:11px;color:#4a8ab0;',
-    '  min-height:15px;line-height:1.4;word-break:break-word;',
-    '}',
-
-    /* скроллбар дропдауна */
-    '#tm-agent-dropdown::-webkit-scrollbar{width:4px;}',
-    '#tm-agent-dropdown::-webkit-scrollbar-track{background:#0d1f33;}',
-    '#tm-agent-dropdown::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:2px;}',
+    '#tm{position:fixed;bottom:20px;right:20px;z-index:2147483647;width:390px;background:#0f1a2b;border:1px solid #1e3a5f;border-radius:14px;box-shadow:0 8px 32px rgba(0,0,0,.6);font-family:Arial,sans-serif;font-size:13px;color:#d0e8ff;overflow:hidden;}',
+    '#tm.col #tmb{display:none;}#tm.col{width:200px;}',
+    '#tmh{display:flex;align-items:center;justify-content:space-between;padding:11px 14px 10px;background:linear-gradient(90deg,#1a3a5c,#0f2540);border-bottom:1px solid #1e3a5f;cursor:pointer;user-select:none;}',
+    '#tmht{display:flex;align-items:center;gap:7px;font-weight:700;font-size:13px;color:#7ecfff;}',
+    '#tmht .dot{width:8px;height:8px;border-radius:50%;background:#3fa;display:inline-block;}',
+    '#tmht .dot.busy{background:#f93;}',
+    '#tmtog{background:none;border:none;color:#5a8ab0;font-size:17px;cursor:pointer;padding:0;}',
+    '#tmtog:hover{color:#7ecfff;}',
+    '#tmb{padding:14px 14px 12px;}',
+    '.tms{margin-bottom:10px;}',
+    '.tml-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;}',
+    '.tml{font-size:11px;color:#5a8ab0;font-weight:600;letter-spacing:.5px;text-transform:uppercase;}',
+    '.tmg{display:flex;gap:4px;}',
+    '.tmbtn{background:none;border:1px solid #1e3a5f;border-radius:5px;color:#5a8ab0;font-size:11px;cursor:pointer;padding:2px 7px;line-height:1.5;white-space:nowrap;}',
+    '.tmbtn:hover{border-color:#2e75b6;color:#7ecfff;background:#0a2040;}',
+    '.tmbtn.on{border-color:#2e75b6;background:#0a2040;color:#7ecfff;}',
+    '.tmad{padding:9px 11px;border-radius:8px;font-size:12px;border:1px solid #1e3a5f;background:#071426;color:#5a8ab0;min-height:36px;display:flex;align-items:center;word-break:break-word;line-height:1.35;}',
+    '.tmad.ok{border-color:#2a6a3a;background:#061510;color:#5fd876;}',
+    '.tmad.err{border-color:#6a2a2a;background:#160606;color:#f06060;}',
+    '#ags{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #1e3a5f;background:#071426;color:#d0e8ff;font-size:12px;outline:none;}',
+    '#ags:focus{border-color:#2e75b6;}#ags::placeholder{color:#3a5a7a;}',
+    '#agd{position:absolute;top:calc(100% + 4px);left:0;right:0;background:#0d1f33;border:1px solid #1e3a5f;border-radius:8px;max-height:180px;overflow-y:auto;z-index:999;box-shadow:0 4px 16px rgba(0,0,0,.5);display:none;}',
+    '#agd.open{display:block;}',
+    '.agdi{padding:7px 10px;cursor:pointer;font-size:12px;border-bottom:1px solid #132030;color:#b0d4f0;}',
+    '.agdi:last-child{border-bottom:none;}.agdi:hover{background:#1a3a5c;color:#7ecfff;}',
+    '.agdi .lg{color:#4a7a9a;font-size:11px;margin-left:5px;}',
+    '#agw{position:relative;}',
+    '#agsel{margin-top:5px;padding:5px 10px;border-radius:6px;background:#0a2040;border:1px solid #2e75b6;font-size:12px;color:#7ecfff;display:flex;align-items:center;justify-content:space-between;}',
+    '#agsel.h{display:none;}',
+    '#agclr{background:none;border:none;color:#5a8ab0;cursor:pointer;font-size:13px;padding:0;}#agclr:hover{color:#f55;}',
+    '#dti{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #1e3a5f;background:#071426;color:#d0e8ff;font-size:12px;outline:none;}',
+    '#dti:focus{border-color:#2e75b6;}#dti::placeholder{color:#3a5a7a;}',
+    '#dthi{font-size:10px;color:#3a6a8a;margin-top:4px;}',
+    '#dtp{margin-top:5px;padding:5px 10px;border-radius:6px;background:#0a2040;border:1px solid #1e3a5f;font-size:11px;color:#5ab0d0;display:none;}',
+    '#dtp.ok{border-color:#2e75b6;color:#7ecfff;display:block;}#dtp.err{border-color:#8b2020;color:#f06060;display:block;}',
+    '.tmback{width:100%;margin-top:7px;padding:5px 10px;border:1px dashed #1e3a5f;border-radius:6px;background:none;color:#4a7a9a;font-size:11px;cursor:pointer;}',
+    '.tmback:hover{border-color:#2e75b6;color:#7ecfff;}',
+    '#tmstart{width:100%;padding:10px;border:none;border-radius:8px;background:linear-gradient(135deg,#2e75b6,#1a5276);color:#fff;font-size:13px;font-weight:700;cursor:pointer;margin-top:4px;}',
+    '#tmstart:hover:not(:disabled){opacity:.9;}#tmstart:disabled{opacity:.4;cursor:not-allowed;}',
+    '#tmpeg{margin-top:10px;background:#071426;border-radius:6px;overflow:hidden;height:6px;display:none;}',
+    '#tmpb{height:100%;width:0%;background:linear-gradient(90deg,#2e75b6,#7ecfff);transition:width .3s ease;}',
+    '#tmst{margin-top:8px;font-size:11px;color:#4a8ab0;min-height:30px;line-height:1.5;word-break:break-word;}',
+    '#agd::-webkit-scrollbar{width:4px;}',
+    '#agd::-webkit-scrollbar-track{background:#0d1f33;}',
+    '#agd::-webkit-scrollbar-thumb{background:#1e3a5f;border-radius:2px;}',
   ].join(''));
 
-  // ============================================================
-  // HTML
-  // ============================================================
-  var panel = document.createElement('div');
-  panel.id = 'tm-panel';
-  panel.innerHTML = [
-    '<div id="tm-header">',
-    '  <div id="tm-header-title">',
-    '    <span class="dot" id="tm-dot"></span>',
-    '    📊 pay_mena Reporter',
-    '  </div>',
-    '  <button id="tm-toggle-btn" title="Свернуть/развернуть">▲</button>',
+  var panel=document.createElement('div');
+  panel.id='tm';
+  panel.innerHTML=[
+    '<div id="tmh">',
+    '  <div id="tmht"><span class="dot" id="tmdot"></span>📊 pay_mena Reporter</div>',
+    '  <button id="tmtog">▲</button>',
     '</div>',
-
-    '<div id="tm-body">',
-
-    '  <div class="tm-section">',
-    '    <div class="tm-label">Агент</div>',
-    '    <div id="tm-agent-wrap">',
-    '      <input id="tm-agent-search" type="text" placeholder="Введи имя или pay_mena_..." autocomplete="off">',
-    '      <div id="tm-agent-dropdown"></div>',
-    '    </div>',
-    '    <div id="tm-agent-selected" class="hidden">',
-    '      <span id="tm-agent-selected-text"></span>',
-    '      <button id="tm-agent-clear" title="Сбросить">✕</button>',
+    '<div id="tmb">',
+    '  <div class="tms">',
+    '    <div class="tml-row"><div class="tml">Агент</div>',
+    '      <div class="tmg">',
+    '        <button class="tmbtn on" id="agab">🔄 Авто</button>',
+    '        <button class="tmbtn" id="agmb">✏️ Вручную</button>',
+    '      </div></div>',
+    '    <div id="agaw"><div class="tmad" id="agav">⏳ Определяю...</div></div>',
+    '    <div id="agmw" style="display:none">',
+    '      <div id="agw">',
+    '        <input id="ags" type="text" placeholder="Введи имя или pay_mena_..." autocomplete="off">',
+    '        <div id="agd"></div>',
+    '      </div>',
+    '      <div id="agsel" class="h"><span id="agst"></span><button id="agclr">✕</button></div>',
+    '      <button class="tmback" id="agbb">← Вернуться к автодетекту</button>',
     '    </div>',
     '  </div>',
-
-    '  <div class="tm-section">',
-    '    <div class="tm-label">Период</div>',
-    '    <input id="tm-date-input" type="text"',
-    '      placeholder="12.05.2026 00:00 ~ 12.05.2026 23:59"',
-    '      autocomplete="off">',
-    '    <div id="tm-date-hint">Вставь или введи диапазон — парсится автоматически</div>',
-    '    <div id="tm-date-parsed"></div>',
+    '  <div class="tms">',
+    '    <div class="tml-row"><div class="tml">Период</div>',
+    '      <div class="tmg">',
+    '        <button class="tmbtn on" id="dtab">🔄 Авто</button>',
+    '        <button class="tmbtn" id="dtmb">✏️ Вручную</button>',
+    '      </div></div>',
+    '    <div id="dtaw"><div class="tmad" id="dtav">⏳ Определяю...</div></div>',
+    '    <div id="dtmw" style="display:none">',
+    '      <input id="dti" type="text" placeholder="12.05.2026 00:00 ~ 12.05.2026 23:59" autocomplete="off">',
+    '      <div id="dthi">Вставь или введи диапазон — парсится автоматически</div>',
+    '      <div id="dtp"></div>',
+    '      <button class="tmback" id="dtbb">← Вернуться к автодетекту</button>',
+    '    </div>',
     '  </div>',
-
-    '  <button id="tm-btn-start">▶ Запустить сбор</button>',
-
-    '  <div id="tm-progress-wrap"><div id="tm-progress-bar"></div></div>',
-    '  <div id="tm-status">Выбери агента и период</div>',
-
+    '  <button id="tmstart">▶ Запустить сбор</button>',
+    '  <div id="tmpeg"><div id="tmpb"></div></div>',
+    '  <div id="tmst">Ожидаю загрузки страницы...</div>',
     '</div>',
   ].join('');
   document.body.appendChild(panel);
 
-  // ============================================================
-  // ЛОГИКА ПАНЕЛИ
-  // ============================================================
-
-  // Свернуть/развернуть
-  var collapsed = false;
-  document.getElementById('tm-header').addEventListener('click', function(e) {
-    if (e.target.id === 'tm-toggle-btn' || e.target.closest('#tm-toggle-btn')) {
-      collapsed = !collapsed;
-      panel.classList.toggle('collapsed', collapsed);
-      document.getElementById('tm-toggle-btn').textContent = collapsed ? '▼' : '▲';
+  var col=false;
+  document.getElementById('tmh').addEventListener('click',function(e){
+    if(e.target.id==='tmtog'||e.target.closest('#tmtog')){
+      col=!col;panel.classList.toggle('col',col);
+      document.getElementById('tmtog').textContent=col?'▼':'▲';
     }
   });
 
-  // ── Список агентов ──────────────────────────────────────────
-  var selectedLogin = null;
-  var allLogins = Object.keys(AGENTS).sort(function(a,b) {
-    return AGENTS[a].localeCompare(AGENTS[b], 'ru');
-  });
-
-  var searchEl   = document.getElementById('tm-agent-search');
-  var dropEl     = document.getElementById('tm-agent-dropdown');
-  var selectedEl = document.getElementById('tm-agent-selected');
-  var selectedTx = document.getElementById('tm-agent-selected-text');
-
-  function buildDropdown(query) {
-    var q = (query || '').toLowerCase().trim();
-    var filtered = allLogins.filter(function(login) {
-      var name = AGENTS[login].toLowerCase();
-      return !q || name.indexOf(q) !== -1 || login.indexOf(q) !== -1;
-    });
-    dropEl.innerHTML = '';
-    if (filtered.length === 0) {
-      dropEl.innerHTML = '<div class="tm-drop-item" style="color:#4a6a8a;cursor:default">Не найдено</div>';
-    } else {
-      filtered.slice(0, 40).forEach(function(login) {
-        var item = document.createElement('div');
-        item.className = 'tm-drop-item';
-        item.innerHTML = AGENTS[login] + '<span class="login">(' + login + ')</span>';
-        item.addEventListener('mousedown', function(e) {
-          e.preventDefault();
-          selectAgent(login);
-        });
-        dropEl.appendChild(item);
-      });
-    }
-    dropEl.classList.add('open');
+  function pad2(v){return('0'+v).slice(-2);}
+  function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+  function setStatus(m){var el=document.getElementById('tmst');if(el)el.textContent=m;}
+  function setProgress(d,t){
+    var p=t>0?Math.round(d/t*100):0;
+    var b=document.getElementById('tmpb');if(b)b.style.width=p+'%';
+    var sk=state.skipped>0?' | ⚠'+state.skipped:'';
+    setStatus('Стр.'+state.currentPage+' | '+d+'/'+t+' ('+p+'%)'+sk);
   }
 
-  function selectAgent(login) {
-    selectedLogin = login;
-    searchEl.value = '';
-    searchEl.placeholder = 'Изменить агента...';
-    dropEl.classList.remove('open');
-    selectedTx.textContent = AGENTS[login] + '  (' + login + ')';
-    selectedEl.classList.remove('hidden');
+  function parseRuDate(s){
+    s=s.trim();
+    var m=s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if(!m)return null;
+    var d=new Date(+m[3],+m[2]-1,+m[1],m[4]?+m[4]:0,m[5]?+m[5]:0,m[6]?+m[6]:0);
+    return isNaN(d.getTime())?null:d;
+  }
+  function parseRange(raw){
+    var p=raw.split(/[~—–]/);if(p.length!==2)return null;
+    var s=parseRuDate(p[0]),e=parseRuDate(p[1]);
+    return(s&&e)?{start:s,end:e}:null;
+  }
+  function fmtDate(d){
+    return pad2(d.getDate())+'.'+pad2(d.getMonth()+1)+'.'+d.getFullYear()+' '+pad2(d.getHours())+':'+pad2(d.getMinutes());
+  }
+  function msToHMS(ms){
+    if(!ms||ms<0)return'00:00:00';
+    return pad2(Math.floor(ms/3600000))+':'+pad2(Math.floor(ms/60000)%60)+':'+pad2(Math.floor(ms/1000)%60);
+  }
+  function sumMs(arr){
+    var ts=arr.reduce(function(a,v){return a+Math.floor(v/1000);},0);
+    return{ms:ts*1000,hms:pad2(Math.floor(ts/3600))+':'+pad2(Math.floor(ts/60)%60)+':'+pad2(ts%60)};
+  }
+  function nameMatch(a,b){
+    if(!a||!b)return false;
+    var wa=a.toLowerCase().split(/\s+/).filter(function(w){return w.length>1;});
+    var wb=b.toLowerCase().split(/\s+/).filter(function(w){return w.length>1;});
+    var n=0;wa.forEach(function(w){if(wb.indexOf(w)!==-1)n++;});return n>=2;
+  }
+  function inShift(ds){
+    var d=new Date(ds.replace(' ','T'));
+    return d>=state.shiftStart&&d<=state.shiftEnd;
+  }
+  function isSenior(txt){
+    if(!txt)return false;
+    var t=txt.toLowerCase().replace(/[^a-z0-9\s]/g,'');
+    return(t.indexOf('wait')!==-1||t.indexOf('waing')!==-1)&&(t.indexOf('senior')!==-1||t.indexOf('senoir')!==-1);
   }
 
-  function clearAgent() {
-    selectedLogin = null;
-    searchEl.value = '';
-    searchEl.placeholder = 'Введи имя или pay_mena_...';
-    selectedEl.classList.add('hidden');
-    dropEl.classList.remove('open');
-  }
-
-  searchEl.addEventListener('focus', function() { buildDropdown(this.value); });
-  searchEl.addEventListener('input', function() { buildDropdown(this.value); });
-  searchEl.addEventListener('blur',  function() { setTimeout(function(){ dropEl.classList.remove('open'); }, 200); });
-  document.getElementById('tm-agent-clear').addEventListener('click', clearAgent);
-
-  // ── Парсинг даты ────────────────────────────────────────────
-  var parsedStart = null;
-  var parsedEnd   = null;
-
-  // Формат: DD.MM.YYYY HH:MM  (время опционально)
-  function parseRuDate(str) {
-    str = str.trim();
-    // DD.MM.YYYY HH:MM или DD.MM.YYYY HH:MM:SS
-    var m = str.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
-    if (!m) return null;
-    var d = new Date(
-      +m[3], +m[2]-1, +m[1],
-      m[4] ? +m[4] : 0,
-      m[5] ? +m[5] : 0,
-      m[6] ? +m[6] : 0
-    );
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  function fmtDate(d) {
-    return pad2(d.getDate())+'.'+pad2(d.getMonth()+1)+'.'+d.getFullYear()+
-           ' '+pad2(d.getHours())+':'+pad2(d.getMinutes());
-  }
-  function pad2(v){ return ('0'+v).slice(-2); }
-
-  var dateInputEl  = document.getElementById('tm-date-input');
-  var dateParsedEl = document.getElementById('tm-date-parsed');
-
-  function tryParseDate(val) {
-    var raw = val.trim();
-    if (!raw) {
-      dateParsedEl.className = '';
-      dateParsedEl.textContent = '';
-      parsedStart = parsedEnd = null;
-      return;
-    }
-    // Разделитель ~ или —
-    var parts = raw.split(/[~—–]/);
-    if (parts.length !== 2) {
-      dateParsedEl.className = 'err';
-      dateParsedEl.textContent = '⚠ Нужно два значения через ~';
-      parsedStart = parsedEnd = null;
-      return;
-    }
-    var s = parseRuDate(parts[0]);
-    var e = parseRuDate(parts[1]);
-    if (!s || !e) {
-      dateParsedEl.className = 'err';
-      dateParsedEl.textContent = '⚠ Не удалось распознать дату';
-      parsedStart = parsedEnd = null;
-      return;
-    }
-    parsedStart = s;
-    parsedEnd   = e;
-    dateParsedEl.className = 'ok';
-    dateParsedEl.textContent = '✓  ' + fmtDate(s) + '  →  ' + fmtDate(e);
-  }
-
-  dateInputEl.addEventListener('input',  function(){ tryParseDate(this.value); });
-  dateInputEl.addEventListener('paste',  function(){
-    var self = this;
-    setTimeout(function(){ tryParseDate(self.value); }, 0);
-  });
-  dateInputEl.addEventListener('change', function(){ tryParseDate(this.value); });
-
-  // ── Автозаполнение из фильтров страницы ─────────────────────
-  setTimeout(autoFillFromPage, 1400);
-
-  function autoFillFromPage() {
-    // Агент
-    var inputs = document.querySelectorAll('input');
-    var adminsInput = null;
-    for (var i = 0; i < inputs.length; i++) {
-      if (inputs[i].placeholder === 'Admins') { adminsInput = inputs[i]; break; }
-    }
-    var tagSpan = adminsInput ? adminsInput.parentElement.querySelector('.multiselect__tag span') : null;
-    if (tagSpan) {
-      var name = tagSpan.textContent.trim();
-      for (var k = 0; k < allLogins.length; k++) {
-        if (nameMatch(name, AGENTS[allLogins[k]])) { selectAgent(allLogins[k]); break; }
+  // ── Автодетект ──────────────────────────────────────────────
+  function detectAgent(){
+    var ins=document.querySelectorAll('input');
+    for(var i=0;i<ins.length;i++){
+      if(ins[i].placeholder==='Admins'){
+        var sp=ins[i].parentElement.querySelector('.multiselect__tag span');
+        if(sp){var nm=sp.textContent.trim();for(var k=0;k<allLogins.length;k++){if(nameMatch(nm,AGENTS[allLogins[k]]))return allLogins[k];}}
+        break;
       }
     }
-
-    // Дата
-    var dateInput = document.querySelector('input.mx-input');
-    if (dateInput && dateInput.value.trim()) {
-      dateInputEl.value = dateInput.value.trim();
-      tryParseDate(dateInputEl.value);
-    }
-
-    if (selectedLogin || parsedStart) {
-      setStatus('Автозаполнено из фильтров. Проверь и запускай.');
-    }
+    return null;
   }
+  function detectDate(){
+    var el=document.querySelector('input.mx-input');
+    return(el&&el.value.trim())?el.value.trim():null;
+  }
+  function refreshAgent(){
+    var lg=detectAgent(),el=document.getElementById('agav');
+    if(lg){selectedLogin=lg;el.className='tmad ok';el.textContent='✓  '+AGENTS[lg]+'  ('+lg+')';}
+    else{selectedLogin=null;el.className='tmad err';el.textContent='⚠  Агент не найден — выбери вручную';}
+  }
+  function refreshDate(){
+    var raw=detectDate(),el=document.getElementById('dtav');
+    if(raw){var r=parseRange(raw);if(r){parsedStart=r.start;parsedEnd=r.end;el.className='tmad ok';el.textContent='✓  '+fmtDate(r.start)+'  →  '+fmtDate(r.end);return;}}
+    parsedStart=null;parsedEnd=null;el.className='tmad err';el.textContent='⚠  Период не найден — введи вручную';
+  }
+  setTimeout(function(){refreshAgent();refreshDate();setStatus('Готов к запуску');},1500);
+  setInterval(function(){if(agentMode==='auto')refreshAgent();if(dateMode==='auto')refreshDate();},2000);
+
+  // ── Переключение режимов ────────────────────────────────────
+  function setAM(m){
+    agentMode=m;
+    document.getElementById('agab').classList.toggle('on',m==='auto');
+    document.getElementById('agmb').classList.toggle('on',m==='manual');
+    document.getElementById('agaw').style.display=m==='auto'?'':'none';
+    document.getElementById('agmw').style.display=m==='manual'?'':'none';
+    if(m==='auto')refreshAgent();
+    else{selectedLogin=null;document.getElementById('agsel').className='h';document.getElementById('ags').value='';setTimeout(function(){document.getElementById('ags').focus();},100);}
+  }
+  function setDM(m){
+    dateMode=m;
+    document.getElementById('dtab').classList.toggle('on',m==='auto');
+    document.getElementById('dtmb').classList.toggle('on',m==='manual');
+    document.getElementById('dtaw').style.display=m==='auto'?'':'none';
+    document.getElementById('dtmw').style.display=m==='manual'?'':'none';
+    if(m==='auto')refreshDate();
+    else{parsedStart=null;parsedEnd=null;setTimeout(function(){document.getElementById('dti').focus();},100);}
+  }
+  document.getElementById('agab').addEventListener('click',function(){setAM('auto');});
+  document.getElementById('agmb').addEventListener('click',function(){setAM('manual');});
+  document.getElementById('agbb').addEventListener('click',function(){setAM('auto');});
+  document.getElementById('dtab').addEventListener('click',function(){setDM('auto');});
+  document.getElementById('dtmb').addEventListener('click',function(){setDM('manual');});
+  document.getElementById('dtbb').addEventListener('click',function(){setDM('auto');});
+
+  // ── Дропдаун ────────────────────────────────────────────────
+  var ags=document.getElementById('ags'),agd=document.getElementById('agd');
+  var agsel=document.getElementById('agsel'),agst=document.getElementById('agst');
+  function buildDrop(q){
+    q=(q||'').toLowerCase().trim();
+    var f=allLogins.filter(function(l){var n=AGENTS[l].toLowerCase();return!q||n.indexOf(q)!==-1||l.indexOf(q)!==-1;});
+    agd.innerHTML='';
+    if(!f.length){agd.innerHTML='<div class="agdi" style="color:#4a6a8a;cursor:default">Не найдено</div>';}
+    else{f.slice(0,40).forEach(function(l){var it=document.createElement('div');it.className='agdi';it.innerHTML=AGENTS[l]+'<span class="lg">('+l+')</span>';it.addEventListener('mousedown',function(e){e.preventDefault();selectedLogin=l;ags.value='';ags.placeholder='Изменить агента...';agd.classList.remove('open');agst.textContent=AGENTS[l]+'  ('+l+')';agsel.className='';});agd.appendChild(it);});}
+    agd.classList.add('open');
+  }
+  ags.addEventListener('focus',function(){buildDrop(this.value);});
+  ags.addEventListener('input',function(){buildDrop(this.value);});
+  ags.addEventListener('blur',function(){setTimeout(function(){agd.classList.remove('open');},200);});
+  document.getElementById('agclr').addEventListener('click',function(){selectedLogin=null;ags.value='';ags.placeholder='Введи имя или pay_mena_...';agsel.className='h';agd.classList.remove('open');});
+
+  // ── Ручная дата ─────────────────────────────────────────────
+  var dti=document.getElementById('dti'),dtp=document.getElementById('dtp');
+  function tryDate(v){
+    v=v.trim();if(!v){dtp.className='';dtp.textContent='';parsedStart=parsedEnd=null;return;}
+    var r=parseRange(v);
+    if(!r){dtp.className='err';dtp.textContent=v.split(/[~—–]/).length!==2?'⚠ Нужно два значения через ~':'⚠ Не удалось распознать дату';parsedStart=parsedEnd=null;return;}
+    parsedStart=r.start;parsedEnd=r.end;dtp.className='ok';dtp.textContent='✓  '+fmtDate(r.start)+'  →  '+fmtDate(r.end);
+  }
+  dti.addEventListener('input',function(){tryDate(this.value);});
+  dti.addEventListener('paste',function(){var s=this;setTimeout(function(){tryDate(s.value);},0);});
+  dti.addEventListener('change',function(){tryDate(this.value);});
 
   // ── Кнопка запуска ──────────────────────────────────────────
-  document.getElementById('tm-btn-start').addEventListener('click', function() {
-    if (state.running) return;
+  document.getElementById('tmstart').addEventListener('click',function(){
+    if(state.running)return;
+    if(!selectedLogin){setStatus('⚠ Агент не определён');return;}
+    if(!parsedStart||!parsedEnd){setStatus('⚠ Период не определён');return;}
+    state.agentLogin=selectedLogin; state.agentName=AGENTS[selectedLogin];
+    state.shiftStart=parsedStart; state.shiftEnd=parsedEnd;
+    state.results=[]; state.countryStat={}; state.statusStat={};
+    state.currentPage=1; state.done=0; state.total=0; state.skipped=0; state.dbg=false;
 
-    if (!selectedLogin)  { setStatus('⚠ Выбери агента'); return; }
-    if (!parsedStart || !parsedEnd) { setStatus('⚠ Укажи корректный период'); return; }
+    console.log('%c[pay_mena v12] СТАРТ','color:#3fa;font-weight:bold');
+    console.log('  Агент:  ',state.agentLogin,state.agentName);
+    console.log('  Смена:  ',state.shiftStart.toLocaleString('ru'),'→',state.shiftEnd.toLocaleString('ru'));
 
-    state.agentLogin  = selectedLogin;
-    state.agentName   = AGENTS[selectedLogin];
-    state.shiftStart  = parsedStart;
-    state.shiftEnd    = parsedEnd;
-    state.results     = [];
-    state.countryStat = {};
-    state.statusStat  = {};
-    state.currentPage = 1;
-    state.done        = 0;
-    state.total       = 0;
-
-    this.disabled = true;
-    document.getElementById('tm-progress-wrap').style.display = 'block';
-    document.getElementById('tm-dot').classList.add('busy');
-    state.running = true;
+    this.disabled=true;
+    document.getElementById('tmpeg').style.display='block';
+    document.getElementById('tmdot').classList.add('busy');
+    state.running=true;
     setStatus('Запуск...');
-    startCollection();
+    collectPage();
   });
 
   // ============================================================
-  // УТИЛИТЫ
+  // FETCH С RETRY — X-Requested-With FIX
   // ============================================================
-  function setStatus(msg) {
-    var el = document.getElementById('tm-status');
-    if (el) el.textContent = msg;
-  }
-  function setProgress(done, total) {
-    var pct = total > 0 ? Math.round(done / total * 100) : 0;
-    var bar = document.getElementById('tm-progress-bar');
-    if (bar) bar.style.width = pct + '%';
-    setStatus('Стр. ' + state.currentPage + ' | ' + done + ' / ' + total + ' тикетов  (' + pct + '%)');
-  }
-  function sleep(ms) { return new Promise(function(r){ setTimeout(r, ms); }); }
+  function fetchTicket(ticketId, attempt) {
+    attempt=attempt||1;
 
-  function msToHMS(ms) {
-    if (!ms || ms < 0) return '00:00:00';
-    var s = Math.floor(ms/1000)%60, m = Math.floor(ms/60000)%60, h = Math.floor(ms/3600000);
-    return pad2(h)+':'+pad2(m)+':'+pad2(s);
-  }
-  function sumMsArray(arr) {
-    var ts = arr.reduce(function(a,v){ return a+Math.floor(v/1000); }, 0);
-    return { ms: ts*1000, hms: pad2(Math.floor(ts/3600))+':'+pad2(Math.floor(ts/60)%60)+':'+pad2(ts%60) };
-  }
-  function nameMatch(a, b) {
-    if (!a||!b) return false;
-    var wa = a.toLowerCase().split(/\s+/).filter(function(w){ return w.length>1; });
-    var wb = b.toLowerCase().split(/\s+/).filter(function(w){ return w.length>1; });
-    var n=0; wa.forEach(function(w){ if(wb.indexOf(w)!==-1) n++; });
-    return n>=2;
-  }
-  function inShift(dateStr) {
-    var d = new Date(dateStr.replace(' ','T'));
-    return d >= state.shiftStart && d <= state.shiftEnd;
-  }
-  function isWaitingForSenior(text) {
-    if (!text) return false;
-    var t = text.toLowerCase().replace(/[^a-z0-9\s]/g,'');
-    return (t.indexOf('wait')!==-1||t.indexOf('waing')!==-1||t.indexOf('wating')!==-1) &&
-           (t.indexOf('senior')!==-1||t.indexOf('senoir')!==-1||t.indexOf('senor')!==-1);
-  }
-  function getCountryFromRow(btn) {
-    var row = btn.closest('tr'); if (!row) return '';
-    var cells = row.querySelectorAll('td');
-    return cells[12] ? cells[12].textContent.trim() : '';
-  }
-  function getTicketId(btn) {
-    var row = btn.closest('tr'); if (!row) return '?';
-    var td = row.querySelector('td'); return td ? td.textContent.trim() : '?';
-  }
-  function closeModal() {
-    document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',keyCode:27,bubbles:true}));
-  }
-  function waitForModal(ticketId, timeout) {
-    return new Promise(function(resolve) {
-      var elapsed=0, t=setInterval(function(){
-        var modal=document.querySelector('.modal_content');
-        var rows=modal?modal.querySelectorAll('table tr'):[];
-        if (modal&&rows.length>=2){clearInterval(t);resolve(modal);return;}
-        elapsed+=100;
-        if (elapsed>=timeout){clearInterval(t);resolve(null);}
-      },100);
+    // Заголовки как у оригинального XHR (ключевой фикс: X-Requested-With)
+    var headers = {
+      'Content-Type':    'application/x-www-form-urlencoded',
+      'X-Requested-With':'XMLHttpRequest',
+      'Accept':          'application/json, */*; q=0.01'
+    };
+    var csrf=document.head.querySelector('meta[name="csrf-token"]');
+    if(csrf) headers['X-CSRF-TOKEN']=csrf.getAttribute('content');
+
+    return fetch('/admin/backoffice/paymentsupporthistory',{
+      method:'POST',
+      headers:headers,
+      credentials:'include',
+      body:'ticketId='+encodeURIComponent(ticketId)+'&is_iframe=1'
+    })
+    .then(function(r){
+      if(r.status===529||r.status===503||r.status===429){
+        if(attempt<=MAX_RETRIES){
+          var ws=attempt*2;
+          setStatus('⏳ Сервер '+r.status+' — тикет '+ticketId+', попытка '+attempt+'/'+MAX_RETRIES+', жду '+ws+'с...');
+          return sleep(ws*1000).then(function(){return fetchTicket(ticketId,attempt+1);});
+        }
+        console.warn('[pay_mena] ПРОПУЩЕН',ticketId,'— статус',r.status);
+        state.skipped++;return null;
+      }
+      return r.text().then(function(text){
+        var t=text.replace(/^\s+/,'');
+        if(t.indexOf('<!DOCTYPE')===0||t.indexOf('<html')===0){
+          console.error('[pay_mena] HTML-ответ (сессия или редирект). Первые 300 символов:',t.slice(0,300));
+          state.running=false;
+          document.getElementById('tmdot').classList.remove('busy');
+          document.getElementById('tmstart').disabled=false;
+          setStatus('🔐 СЕССИЯ ИСТЕКЛА — войди в аккаунт заново. Собрано: '+state.results.length+' записей.');
+          throw new Error('SESSION_EXPIRED');
+        }
+        try{return JSON.parse(text);}
+        catch(e){
+          console.error('[pay_mena] JSON parse error тикет '+ticketId+':',text.slice(0,150));
+          if(attempt<=MAX_RETRIES) return sleep(RETRY_DELAY_MS).then(function(){return fetchTicket(ticketId,attempt+1);});
+          state.skipped++;return null;
+        }
+      });
+    })
+    .catch(function(e){
+      if(e.message==='SESSION_EXPIRED')throw e;
+      if(attempt<=MAX_RETRIES){
+        setStatus('🔁 Сетевая ошибка — тикет '+ticketId+', retry '+attempt+'/'+MAX_RETRIES);
+        return sleep(RETRY_DELAY_MS).then(function(){return fetchTicket(ticketId,attempt+1);});
+      }
+      state.skipped++;return null;
     });
   }
 
   // ============================================================
   // ПАРСИНГ ТИКЕТА
   // ============================================================
-  function processSingleTicket(btn) {
-    var ticketId = getTicketId(btn);
-    var country  = getCountryFromRow(btn);
-    btn.click();
-    return waitForModal(ticketId, MODAL_WAIT_MS).then(function(modal) {
-      if (!modal) { closeModal(); return []; }
+  function processTkt(info, resp) {
+    if(!resp||!resp.success||!resp.data){
+      if(!state.dbg){console.warn('[pay_mena] ДИАГНОЗ тикет '+info.ticketId+': пустой/неуспешный ответ',resp);}
+      return[];
+    }
+    var rows=resp.data.map(function(r){return{date:r.dateEdit||'',comment:r.commentSupport||'',status:r.nameExternalStatus||'',admin:r.adminProcessedLogin||''};});
+    rows.sort(function(a,b){return new Date(a.date.replace(' ','T'))-new Date(b.date.replace(' ','T'));});
 
-      var allRows=[];
-      modal.querySelectorAll('table tr').forEach(function(row,idx){
-        if (idx===0) return;
-        var cells=row.querySelectorAll('td'); if (cells.length<10) return;
-        var date=cells[0]?cells[0].textContent.trim():'';
-        var comment=cells[4]?cells[4].textContent.trim():'';
-        var status=cells[5]?cells[5].textContent.trim():'';
-        var admin=cells[9]?cells[9].textContent.trim():'';
-        if (date) allRows.push({date:date,insideComment:comment,externalStatus:status,adminUsername:admin});
-      });
-      allRows.sort(function(a,b){ return new Date(a.date.replace(' ','T'))-new Date(b.date.replace(' ','T')); });
+    if(!state.dbg){
+      state.dbg=true;
+      var admins=[];rows.forEach(function(r){if(admins.indexOf(r.admin)===-1)admins.push(r.admin);});
+      console.log('%c[pay_mena] ДИАГНОЗ — тикет '+info.ticketId,'color:#f93;font-weight:bold');
+      console.log('  Ищем агента:        "'+state.agentLogin+'"');
+      console.log('  Смена:              '+state.shiftStart.toLocaleString('ru')+' → '+state.shiftEnd.toLocaleString('ru'));
+      console.log('  Строк в истории:    '+rows.length);
+      console.log('  Админы в истории:   ',JSON.stringify(admins));
+      console.log('  Даты:               '+(rows[0]?rows[0].date:'?')+' ... '+(rows[rows.length-1]?rows[rows.length-1].date:'?'));
+      console.log('  По агенту:          '+rows.filter(function(r){return r.admin===state.agentLogin;}).length);
+      console.log('  По смене:           '+rows.filter(function(r){return inShift(r.date);}).length);
+      console.log('  По обоим (итог):    '+rows.filter(function(r){return r.admin===state.agentLogin&&inShift(r.date);}).length);
+    }
 
-      var agentRows=allRows.filter(function(r){ return r.adminUsername===state.agentLogin&&inShift(r.date); });
-      closeModal();
-      if (agentRows.length===0) return [];
+    var ar=rows.filter(function(r){return r.admin===state.agentLogin&&inShift(r.date);});
+    if(!ar.length)return[];
 
-      var pairs=[],ipRow=null;
-      agentRows.forEach(function(cur){
-        var isIP=cur.externalStatus.toLowerCase().indexOf('in progress')!==-1;
-        if (isIP) { ipRow=cur; }
-        else {
-          pairs.push(ipRow
-            ? {startDate:ipRow.date,startStatus:ipRow.externalStatus,endDate:cur.date,endStatus:cur.externalStatus,insideComment:cur.insideComment,hadInProgress:true}
-            : {startDate:'',startStatus:'',endDate:cur.date,endStatus:cur.externalStatus,insideComment:cur.insideComment,hadInProgress:false}
-          );
-          ipRow=null;
-        }
-      });
-      if (ipRow) pairs.push({startDate:ipRow.date,startStatus:ipRow.externalStatus,endDate:'',endStatus:'',insideComment:ipRow.insideComment,hadInProgress:true});
-
-      var ticketResults=pairs.map(function(pair){
-        var duration=(pair.startDate&&pair.endDate)?msToHMS(new Date(pair.endDate.replace(' ','T'))-new Date(pair.startDate.replace(' ','T'))):'';
-        var isDuplicate=pair.endStatus&&pair.endStatus.toLowerCase().indexOf('duplicat')!==-1;
-        var isSenior=isWaitingForSenior(pair.insideComment);
-        var note=isSenior?'Ожидает ответа в чате Q&A Hub':isDuplicate?'Дубликат':!pair.hadInProgress?'БЕЗ IN PROGRESS':'';
-        if (pair.endStatus) state.statusStat[pair.endStatus]=(state.statusStat[pair.endStatus]||0)+1;
-        return {ticketId:ticketId,country:country,login:state.agentLogin,agentName:state.agentName,
-                startDate:pair.startDate,startStatus:pair.startStatus,endDate:pair.endDate,endStatus:pair.endStatus,
-                duration:duration,note:note,isDuplicate:isDuplicate,isSenior:isSenior,hadInProgress:pair.hadInProgress};
-      });
-      if (country) state.countryStat[country]=(state.countryStat[country]||0)+1;
-      return ticketResults;
+    var pairs=[],ip=null;
+    ar.forEach(function(cur){
+      var isIP=cur.status.toLowerCase().indexOf('in progress')!==-1;
+      if(isIP){ip=cur;}
+      else{
+        pairs.push(ip?{sd:ip.date,ss:ip.status,ed:cur.date,es:cur.status,cm:cur.comment,hp:true}
+                     :{sd:'',ss:'',ed:cur.date,es:cur.status,cm:cur.comment,hp:false});
+        ip=null;
+      }
     });
+    if(ip)pairs.push({sd:ip.date,ss:ip.status,ed:'',es:'',cm:ip.comment,hp:true});
+
+    var res=pairs.map(function(p){
+      var dur=(p.sd&&p.ed)?msToHMS(new Date(p.ed.replace(' ','T'))-new Date(p.sd.replace(' ','T'))):'';
+      var isDup=p.es&&p.es.toLowerCase().indexOf('duplicat')!==-1;
+      var isSen=isSenior(p.cm);
+      var note=isSen?'Ожидает ответа в чате Q&A Hub':isDup?'Дубликат':!p.hp?'БЕЗ IN PROGRESS':'';
+      if(p.es)state.statusStat[p.es]=(state.statusStat[p.es]||0)+1;
+      return{ticketId:info.ticketId,country:info.country,login:state.agentLogin,agentName:state.agentName,
+             startDate:p.sd,startStatus:p.ss,endDate:p.ed,endStatus:p.es,
+             duration:dur,note:note,isDuplicate:isDup,isSenior:isSen,hadInProgress:p.hp};
+    });
+    if(info.country)state.countryStat[info.country]=(state.countryStat[info.country]||0)+1;
+    return res;
   }
 
   // ============================================================
-  // ЦИКЛ ОБХОДА
+  // ПОСЛЕДОВАТЕЛЬНАЯ ОБРАБОТКА
   // ============================================================
-  function processPageBatch(buttons, offset) {
-    if (offset>=buttons.length) return Promise.resolve();
-    var btn=buttons[offset];
-    state.done++; setProgress(state.done,state.total);
-    return processSingleTicket(btn).then(function(data){
-      data.forEach(function(r){ state.results.push(r); });
-      return sleep(AFTER_CLOSE_MS);
-    }).then(function(){ return processPageBatch(buttons,offset+1); });
+  function runSeq(tickets,i){
+    if(i>=tickets.length)return Promise.resolve();
+    var t=tickets[i];
+    setStatus('Стр.'+state.currentPage+' | тикет '+(state.done+1)+'/'+state.total+' → '+t.ticketId);
+    return fetchTicket(t.ticketId)
+      .then(function(resp){
+        processTkt(t,resp).forEach(function(r){state.results.push(r);});
+        state.done++;setProgress(state.done,state.total);
+        return sleep(DELAY_MS);
+      })
+      .then(function(){return runSeq(tickets,i+1);})
+      .catch(function(e){if(e.message==='SESSION_EXPIRED')return;throw e;});
   }
 
-  function startCollection() { collectPage(); }
-
-  function collectPage() {
-    var buttons=Array.from(document.querySelectorAll('a')).filter(function(a){ return a.textContent.trim()==='Show'; });
-    state.total+=buttons.length; setProgress(state.done,state.total);
-    processPageBatch(buttons,0).then(goNextPage);
+  // ============================================================
+  // СТРАНИЦЫ
+  // ============================================================
+  function collectPage(){
+    var rows=Array.from(document.querySelectorAll('table tbody tr')),tickets=[];
+    rows.forEach(function(row){
+      var tds=row.querySelectorAll('td');if(!tds.length)return;
+      var id=tds[0]?tds[0].textContent.trim():'';
+      if(!id||!/^\d{5,}$/.test(id))return;
+      tickets.push({ticketId:id,country:tds[12]?tds[12].textContent.trim():''});
+    });
+    state.total+=tickets.length;
+    console.log('[pay_mena] Стр.'+state.currentPage+': '+tickets.length+' тикетов, первый: '+(tickets[0]&&tickets[0].ticketId));
+    setProgress(state.done,state.total);
+    runSeq(tickets,0).then(nextPage);
   }
 
-  function goNextPage() {
+  function nextPage(){
     var links=Array.from(document.querySelectorAll('a'));
-    var nextBtn=null, nextNum=String(state.currentPage+1);
-    for (var k=0;k<links.length;k++){
-      if (links[k].textContent.trim()===nextNum){nextBtn=links[k];break;}
-    }
-    if (!nextBtn) {
+    var num=String(state.currentPage+1),btn=null;
+    for(var k=0;k<links.length;k++){if(links[k].textContent.trim()===num){btn=links[k];break;}}
+    if(!btn){
       state.running=false;
-      document.getElementById('tm-dot').classList.remove('busy');
-      setStatus('✅ Готово! Генерирую файл...');
-      generateXLSX(); return;
+      document.getElementById('tmdot').classList.remove('busy');
+      setStatus('✅ Генерирую файл...');
+      console.log('[pay_mena] Готово. Записей:',state.results.length,'Пропущено:',state.skipped);
+      genXLSX();return;
     }
-    state.currentPage++; nextBtn.click();
-    setTimeout(collectPage, PAGE_WAIT_MS);
+    state.currentPage++;btn.click();setTimeout(collectPage,PAGE_WAIT_MS);
   }
 
   // ============================================================
-  // ГЕНЕРАЦИЯ XLSX (таблицы без изменений)
+  // XLSX
   // ============================================================
-  function generateXLSX() {
+  function genXLSX(){
     var wb=XLSX.utils.book_new();
-    var C={
-      navyBg:'FF1F4E79',navyFg:'FFFFFFFF',
-      blueBg:'FFDAE8F0',blueFg:'FF1F4E79',
-      green:'FFC6EFCE',greenFg:'FF375623',
-      yellow:'FFFFEB9C',yellowFg:'FF9C6500',
-      red:'FFFFC7CE',redFg:'FF9C0006',
-      orange:'FFFCE4D6',orangeFg:'FFB85C00',
-      grey:'FFF2F2F2',greyFg:'FF595959',
-      white:'FFFFFFFF',darkText:'FF1F1F1F',
-      altRow:'FFF7FBFF'
-    };
-    function hdr(){return{font:{bold:true,color:{rgb:C.navyFg},name:'Arial',sz:10},fill:{fgColor:{rgb:C.navyBg}},alignment:{horizontal:'center',vertical:'center',wrapText:true},border:{bottom:{style:'medium',color:{rgb:C.navyBg}},right:{style:'thin',color:{rgb:'FFAAAAAA'}}}};}
-    function cellS(bg,fg,center){return{font:{color:{rgb:fg||C.darkText},name:'Arial',sz:10},fill:{fgColor:{rgb:bg||C.white}},alignment:{horizontal:center?'center':'left',vertical:'center',wrapText:true},border:{right:{style:'thin',color:{rgb:'FFD9D9D9'}},bottom:{style:'thin',color:{rgb:'FFD9D9D9'}}}};}
-    function secHdr(){return{font:{bold:true,color:{rgb:C.navyFg},name:'Arial',sz:11},fill:{fgColor:{rgb:'FF2E75B6'}},alignment:{horizontal:'left',vertical:'center'},border:{bottom:{style:'medium',color:{rgb:'FF1F4E79'}}}};}
-    function labelS(){return{font:{bold:true,color:{rgb:C.greyFg},name:'Arial',sz:10},fill:{fgColor:{rgb:C.grey}},alignment:{horizontal:'left',vertical:'center'},border:{right:{style:'thin',color:{rgb:'FFD9D9D9'}},bottom:{style:'thin',color:{rgb:'FFD9D9D9'}}}};}
-    function valS(bg,fg){return{font:{color:{rgb:fg||C.darkText},name:'Arial',sz:10},fill:{fgColor:{rgb:bg||C.white}},alignment:{horizontal:'left',vertical:'center'},border:{right:{style:'thin',color:{rgb:'FFD9D9D9'}},bottom:{style:'thin',color:{rgb:'FFD9D9D9'}}}};}
+    var C={nB:'FF1F4E79',nF:'FFFFFFFF',bB:'FFDAE8F0',bF:'FF1F4E79',gB:'FFC6EFCE',gF:'FF375623',yB:'FFFFEB9C',yF:'FF9C6500',rB:'FFFFC7CE',rF:'FF9C0006',oB:'FFFCE4D6',oF:'FFB85C00',grB:'FFF2F2F2',grF:'FF595959',W:'FFFFFFFF',DT:'FF1F1F1F',alt:'FFF7FBFF'};
+    function hdr(){return{font:{bold:true,color:{rgb:C.nF},name:'Arial',sz:10},fill:{fgColor:{rgb:C.nB}},alignment:{horizontal:'center',vertical:'center',wrapText:true},border:{bottom:{style:'medium',color:{rgb:C.nB}},right:{style:'thin',color:{rgb:'FFAAAAAA'}}}};}
+    function cs(bg,fg,ce){return{font:{color:{rgb:fg||C.DT},name:'Arial',sz:10},fill:{fgColor:{rgb:bg||C.W}},alignment:{horizontal:ce?'center':'left',vertical:'center',wrapText:true},border:{right:{style:'thin',color:{rgb:'FFD9D9D9'}},bottom:{style:'thin',color:{rgb:'FFD9D9D9'}}}};}
+    function sh(){return{font:{bold:true,color:{rgb:C.nF},name:'Arial',sz:11},fill:{fgColor:{rgb:'FF2E75B6'}},alignment:{horizontal:'left',vertical:'center'},border:{bottom:{style:'medium',color:{rgb:'FF1F4E79'}}}};}
+    function lb(){return{font:{bold:true,color:{rgb:C.grF},name:'Arial',sz:10},fill:{fgColor:{rgb:C.grB}},alignment:{horizontal:'left',vertical:'center'},border:{right:{style:'thin',color:{rgb:'FFD9D9D9'}},bottom:{style:'thin',color:{rgb:'FFD9D9D9'}}}};}
+    function vl(bg,fg){return{font:{color:{rgb:fg||C.DT},name:'Arial',sz:10},fill:{fgColor:{rgb:bg||C.W}},alignment:{horizontal:'left',vertical:'center'},border:{right:{style:'thin',color:{rgb:'FFD9D9D9'}},bottom:{style:'thin',color:{rgb:'FFD9D9D9'}}}};}
 
     // Raw
-    var rawHdrs=['Ticket ID','Country','Login','Agent Name','Start Date','Start Status','End Date','End Status','Duration','Note'];
-    var rawData=[rawHdrs].concat(state.results.map(function(r){return[r.ticketId,r.country,r.login,r.agentName,r.startDate,r.startStatus,r.endDate,r.endStatus,r.duration,r.note];}));
-    var wsRaw=XLSX.utils.aoa_to_sheet(rawData);
-    wsRaw['!cols']=[{wch:14},{wch:12},{wch:18},{wch:26},{wch:20},{wch:22},{wch:20},{wch:24},{wch:12},{wch:30}];
-    var rr=XLSX.utils.decode_range(wsRaw['!ref']);
-    for(var c0=rr.s.c;c0<=rr.e.c;c0++){var ha=XLSX.utils.encode_cell({r:0,c:c0});if(wsRaw[ha])wsRaw[ha].s=hdr();}
-    for(var r0=1;r0<=rr.e.r;r0++){
-      var nAddr=XLSX.utils.encode_cell({r:r0,c:9});var nVal=wsRaw[nAddr]?wsRaw[nAddr].v:'';var bg0=r0%2===0?C.altRow:C.white;
-      for(var c1=rr.s.c;c1<=rr.e.c;c1++){
-        var addr=XLSX.utils.encode_cell({r:r0,c:c1});if(!wsRaw[addr])wsRaw[addr]={t:'s',v:''};
-        wsRaw[addr].s=nVal==='Ожидает ответа в чате Q&A Hub'?cellS(C.orange,C.orangeFg):nVal==='Дубликат'?cellS(C.blueBg,C.blueFg):nVal==='БЕЗ IN PROGRESS'?cellS(C.yellow,C.yellowFg):cellS(bg0);
-      }
+    var rh=['Ticket ID','Country','Login','Agent Name','Start Date','Start Status','End Date','End Status','Duration','Note'];
+    var rd=[rh].concat(state.results.map(function(r){return[r.ticketId,r.country,r.login,r.agentName,r.startDate,r.startStatus,r.endDate,r.endStatus,r.duration,r.note];}));
+    var wR=XLSX.utils.aoa_to_sheet(rd);
+    wR['!cols']=[{wch:14},{wch:12},{wch:18},{wch:26},{wch:20},{wch:22},{wch:20},{wch:24},{wch:12},{wch:30}];
+    var rr=XLSX.utils.decode_range(wR['!ref']);
+    for(var c=rr.s.c;c<=rr.e.c;c++){var ha=XLSX.utils.encode_cell({r:0,c:c});if(wR[ha])wR[ha].s=hdr();}
+    for(var r=1;r<=rr.e.r;r++){
+      var na=XLSX.utils.encode_cell({r:r,c:9}),nv=wR[na]?wR[na].v:'',bg=r%2===0?C.alt:C.W;
+      for(var ci=rr.s.c;ci<=rr.e.c;ci++){var a=XLSX.utils.encode_cell({r:r,c:ci});if(!wR[a])wR[a]={t:'s',v:''};wR[a].s=nv==='Ожидает ответа в чате Q&A Hub'?cs(C.oB,C.oF):nv==='Дубликат'?cs(C.bB,C.bF):nv==='БЕЗ IN PROGRESS'?cs(C.yB,C.yF):cs(bg);}
     }
-    wsRaw['!freeze']={xSplit:0,ySplit:1};
-    XLSX.utils.book_append_sheet(wb,wsRaw,'Raw');
+    wR['!freeze']={xSplit:0,ySplit:1};XLSX.utils.book_append_sheet(wb,wR,'Raw');
 
     // Processed
     var sorted=state.results.filter(function(r){return r.startDate&&r.endDate&&r.hadInProgress;}).sort(function(a,b){return new Date(a.startDate.replace(' ','T'))-new Date(b.startDate.replace(' ','T'));});
-    var intervals=[],procTimes=[],statusCount={},countryCount={},prevEnd=null;
-    var procData=[['Ticket ID','Country','Start Time','End Time','Processing Time','Interval Since Previous','End Status','Note']];
+    var itvs=[],prts=[],sCnt={},cCnt={},pEnd=null;
+    var pd=[['Ticket ID','Country','Start Time','End Time','Processing Time','Interval Since Previous','End Status','Note']];
     sorted.forEach(function(row,pi){
-      var start=new Date(row.startDate.replace(' ','T')),end=new Date(row.endDate.replace(' ','T'));
-      var procMs=end-start,intrvMs=(prevEnd&&pi>0)?Math.max(0,start-prevEnd):0;
-      prevEnd=end;
-      procTimes.push({ticket:row.ticketId,ms:procMs});
-      if(pi>0)intervals.push({ticket:row.ticketId,ms:intrvMs});
-      if(row.endStatus)statusCount[row.endStatus]=(statusCount[row.endStatus]||0)+1;
-      if(row.country)countryCount[row.country]=(countryCount[row.country]||0)+1;
-      procData.push([row.ticketId,row.country,row.startDate,row.endDate,msToHMS(procMs),pi>0?msToHMS(intrvMs):'—',row.endStatus,row.note]);
+      var s=new Date(row.startDate.replace(' ','T')),e=new Date(row.endDate.replace(' ','T'));
+      var pm=e-s,im=(pEnd&&pi>0)?Math.max(0,s-pEnd):0;pEnd=e;
+      prts.push({ticket:row.ticketId,ms:pm});if(pi>0)itvs.push({ticket:row.ticketId,ms:im});
+      if(row.endStatus)sCnt[row.endStatus]=(sCnt[row.endStatus]||0)+1;
+      if(row.country)cCnt[row.country]=(cCnt[row.country]||0)+1;
+      pd.push([row.ticketId,row.country,row.startDate,row.endDate,msToHMS(pm),pi>0?msToHMS(im):'—',row.endStatus,row.note]);
     });
-    var wsProc=XLSX.utils.aoa_to_sheet(procData);
-    wsProc['!cols']=[{wch:14},{wch:12},{wch:20},{wch:20},{wch:16},{wch:22},{wch:24},{wch:30}];
-    var pr=XLSX.utils.decode_range(wsProc['!ref']);
-    for(var c2=pr.s.c;c2<=pr.e.c;c2++){var hp=XLSX.utils.encode_cell({r:0,c:c2});if(wsProc[hp])wsProc[hp].s=hdr();}
-    for(var r1=1;r1<=pr.e.r;r1++){
-      var iCell=XLSX.utils.encode_cell({r:r1,c:5}),iVal=wsProc[iCell]?wsProc[iCell].v:'—',iMin=0;
-      if(iVal&&iVal!=='—'){var pts=iVal.split(':');iMin=(+pts[0])*60+(+pts[1]);}
-      var ibg=iVal==='—'||iMin===0?C.white:iMin<=INTERVAL_GREEN?C.green:iMin<=INTERVAL_YELLOW?C.yellow:C.red;
-      var ifg=iVal==='—'||iMin===0?C.darkText:iMin<=INTERVAL_GREEN?C.greenFg:iMin<=INTERVAL_YELLOW?C.yellowFg:C.redFg;
-      for(var c3=pr.s.c;c3<=pr.e.c;c3++){var pa=XLSX.utils.encode_cell({r:r1,c:c3});if(!wsProc[pa])wsProc[pa]={t:'s',v:''};wsProc[pa].s=cellS(ibg,ifg);}
+    var wP=XLSX.utils.aoa_to_sheet(pd);
+    wP['!cols']=[{wch:14},{wch:12},{wch:20},{wch:20},{wch:16},{wch:22},{wch:24},{wch:30}];
+    var pr=XLSX.utils.decode_range(wP['!ref']);
+    for(var c2=pr.s.c;c2<=pr.e.c;c2++){var hp=XLSX.utils.encode_cell({r:0,c:c2});if(wP[hp])wP[hp].s=hdr();}
+    for(var r2=1;r2<=pr.e.r;r2++){
+      var ic=XLSX.utils.encode_cell({r:r2,c:5}),iv=wP[ic]?wP[ic].v:'—',im2=0;
+      if(iv&&iv!=='—'){var pt=iv.split(':');im2=(+pt[0])*60+(+pt[1]);}
+      var ibg=iv==='—'||im2===0?C.W:im2<=INTERVAL_GREEN?C.gB:im2<=INTERVAL_YELLOW?C.yB:C.rB;
+      var ifg=iv==='—'||im2===0?C.DT:im2<=INTERVAL_GREEN?C.gF:im2<=INTERVAL_YELLOW?C.yF:C.rF;
+      for(var c3=pr.s.c;c3<=pr.e.c;c3++){var pa=XLSX.utils.encode_cell({r:r2,c:c3});if(!wP[pa])wP[pa]={t:'s',v:''};wP[pa].s=cs(ibg,ifg);}
     }
-    wsProc['!freeze']={xSplit:0,ySplit:1};
-    XLSX.utils.book_append_sheet(wb,wsProc,'Processed');
+    wP['!freeze']={xSplit:0,ySplit:1};XLSX.utils.book_append_sheet(wb,wP,'Processed');
 
     // Dashboard
-    var sumIntv=sumMsArray(intervals.map(function(i){return i.ms;}));
-    var avgIntrvMs=intervals.length>0?sumIntv.ms/intervals.length:0;
-    var maxIntv=intervals.reduce(function(m,i){return i.ms>m.ms?i:m;},{ms:0,ticket:'-'});
-    var sumProc=sumMsArray(procTimes.map(function(i){return i.ms;}));
-    var avgProcMs=procTimes.length>0?sumProc.ms/procTimes.length:0;
-    var maxProc=procTimes.reduce(function(m,i){return i.ms>m.ms?i:m;},{ms:0,ticket:'-'});
-    var topSK='',topSV=0;
-    Object.keys(statusCount).forEach(function(k){if(statusCount[k]>topSV){topSV=statusCount[k];topSK=k;}});
-    var noIPCount=state.results.filter(function(r){return!r.hadInProgress&&!r.isDuplicate;}).length;
-    var dupCount=state.results.filter(function(r){return r.isDuplicate;}).length;
-    var seniorCount=state.results.filter(function(r){return r.isSenior;}).length;
-    var inProgNow=state.results.filter(function(r){return r.startDate&&!r.endDate;}).sort(function(a,b){return new Date(a.startDate.replace(' ','T'))-new Date(b.startDate.replace(' ','T'));});
-    var breakExceeded=sumIntv.ms>=BREAK_LIMIT_MS;
-    var statusArr=Object.keys(state.statusStat).map(function(k){return{k:k,v:state.statusStat[k]};}).sort(function(a,b){return b.v-a.v;});
-    var countryArr=Object.keys(state.countryStat).map(function(k){return{k:k,v:state.countryStat[k]};}).sort(function(a,b){return b.v-a.v;});
-    var topIntervals=intervals.filter(function(i){return i.ms>=MIN_INTERVAL_SHOW_MS;}).sort(function(a,b){return b.ms-a.ms;});
+    var si=sumMs(itvs.map(function(i){return i.ms;}));
+    var ai=itvs.length>0?si.ms/itvs.length:0;
+    var mp=prts.reduce(function(m,i){return i.ms>m.ms?i:m;},{ms:0,ticket:'-'});
+    var ap=prts.length>0?sumMs(prts.map(function(i){return i.ms;})).ms/prts.length:0;
+    var tsk='',tsv=0;Object.keys(sCnt).forEach(function(k){if(sCnt[k]>tsv){tsv=sCnt[k];tsk=k;}});
+    var noIP=state.results.filter(function(r){return!r.hadInProgress&&!r.isDuplicate;}).length;
+    var dup=state.results.filter(function(r){return r.isDuplicate;}).length;
+    var sen=state.results.filter(function(r){return r.isSenior;}).length;
+    var inp=state.results.filter(function(r){return r.startDate&&!r.endDate;}).sort(function(a,b){return new Date(a.startDate.replace(' ','T'))-new Date(b.startDate.replace(' ','T'));});
+    var bex=si.ms>=BREAK_LIMIT_MS;
+    var sArr=Object.keys(state.statusStat).map(function(k){return{k:k,v:state.statusStat[k]};}).sort(function(a,b){return b.v-a.v;});
+    var cArr=Object.keys(state.countryStat).map(function(k){return{k:k,v:state.countryStat[k]};}).sort(function(a,b){return b.v-a.v;});
+    var topI=itvs.filter(function(i){return i.ms>=MIN_BREAK_SHOW;}).sort(function(a,b){return b.ms-a.ms;});
 
     var ws={},ROW=0;
-    function w(col,v,style,type){var a=XLSX.utils.encode_cell({r:ROW,c:col});ws[a]={t:type||'s',v:v==null?'':v};if(style)ws[a].s=style;}
-    function nr(){ROW++;}function br(){ROW++;}
+    function w(col,v,sty,tp){var a=XLSX.utils.encode_cell({r:ROW,c:col});ws[a]={t:tp||'s',v:v==null?'':v};if(sty)ws[a].s=sty;}
+    function nr(){ROW++;} function br(){ROW++;}
 
-    w(0,'ОБЩАЯ СТАТИСТИКА',secHdr());w(1,'',secHdr());w(2,'',secHdr());w(3,'',secHdr());nr();
-    [
-      ['Агент',state.agentName+' ('+state.agentLogin+')',null],
-      ['Период',state.shiftStart.toLocaleString('ru')+' — '+state.shiftEnd.toLocaleString('ru'),null],
-      ['Всего записей',state.results.length,'n'],
-      ['Тикетов с полными датами',sorted.length,'n'],
-      ['Самый частый статус',topSK+' ('+topSV+')',null],
-      ['Дубликатов',dupCount,'n'],
-      ['Без In Progress',noIPCount,'n'],
-      ['Ожидали Q&A Hub',seniorCount,'n'],
-      ['Среднее время обработки',msToHMS(avgProcMs),null],
-      ['Макс. время обработки',msToHMS(maxProc.ms)+' (тикет '+maxProc.ticket+')',null],
-      ['Средний интервал',msToHMS(avgIntrvMs),null],
-      ['Суммарные перерывы',sumIntv.hms,breakExceeded?[C.red,C.redFg]:[C.green,C.greenFg]],
-      ['Лимит перерывов',breakExceeded?'ПРЕВЫШЕН':'В норме',breakExceeded?[C.red,C.redFg]:[C.green,C.greenFg]],
-    ].forEach(function(s){
-      w(0,s[0],labelS());w(1,s[1],valS(s[2]?s[2][0]:C.white,s[2]?s[2][1]:C.darkText),s[3]||null);
-      w(2,'',cellS(C.white));w(3,'',cellS(C.white));nr();
-    });
+    w(0,'ОБЩАЯ СТАТИСТИКА',sh());w(1,'',sh());w(2,'',sh());w(3,'',sh());nr();
+    [['Агент',state.agentName+' ('+state.agentLogin+')',null],
+     ['Период',state.shiftStart.toLocaleString('ru')+' — '+state.shiftEnd.toLocaleString('ru'),null],
+     ['Всего записей',state.results.length,'n'],['Тикетов с полными датами',sorted.length,'n'],
+     ['Самый частый статус',tsk+' ('+tsv+')',null],['Дубликатов',dup,'n'],
+     ['Без In Progress',noIP,'n'],['Ожидали Q&A Hub',sen,'n'],
+     ['Пропущено (ошибки)',state.skipped,'n'],
+     ['Среднее время обработки',msToHMS(ap),null],['Макс. время обработки',msToHMS(mp.ms)+' (тикет '+mp.ticket+')',null],
+     ['Средний интервал',msToHMS(ai),null],
+     ['Суммарные перерывы',si.hms,bex?[C.rB,C.rF]:[C.gB,C.gF]],
+     ['Лимит перерывов',bex?'ПРЕВЫШЕН':'В норме',bex?[C.rB,C.rF]:[C.gB,C.gF]],
+    ].forEach(function(s){w(0,s[0],lb());w(1,s[1],vl(s[2]?s[2][0]:C.W,s[2]?s[2][1]:C.DT),s[3]||null);w(2,'',cs(C.W));w(3,'',cs(C.W));nr();});
     br();
-    w(0,'СТАТУСЫ',secHdr());w(1,'',secHdr());w(2,'',secHdr());w(3,'',secHdr());nr();
-    w(0,'Статус',labelS());w(1,'Кол-во',labelS());w(2,'',cellS(C.white));w(3,'',cellS(C.white));nr();
-    statusArr.forEach(function(s,i){var rb=i%2===0?C.white:C.altRow;w(0,s.k,cellS(rb));w(1,s.v,cellS(rb,C.darkText,true),'n');w(2,'',cellS(C.white));w(3,'',cellS(C.white));nr();});
-    w(0,'ИТОГО',labelS());w(1,state.results.length,valS(C.blueBg,C.blueFg),'n');nr();br();
-    w(0,'ТОП СТРАН',secHdr());w(1,'',secHdr());w(2,'',secHdr());w(3,'',secHdr());nr();
-    w(0,'Страна',labelS());w(1,'Тикетов',labelS());w(2,'',cellS(C.white));w(3,'',cellS(C.white));nr();
-    countryArr.slice(0,10).forEach(function(c,i){var cb=i%2===0?C.white:C.altRow;w(0,c.k,cellS(cb));w(1,c.v,cellS(cb,C.darkText,true),'n');w(2,'',cellS(C.white));w(3,'',cellS(C.white));nr();});
+    w(0,'СТАТУСЫ',sh());w(1,'',sh());w(2,'',sh());w(3,'',sh());nr();
+    w(0,'Статус',lb());w(1,'Кол-во',lb());w(2,'',cs(C.W));w(3,'',cs(C.W));nr();
+    sArr.forEach(function(s,i){var rb=i%2===0?C.W:C.alt;w(0,s.k,cs(rb));w(1,s.v,cs(rb,C.DT,true),'n');w(2,'',cs(C.W));w(3,'',cs(C.W));nr();});
+    w(0,'ИТОГО',lb());w(1,state.results.length,vl(C.bB,C.bF),'n');nr();br();
+    w(0,'ТОП СТРАН',sh());w(1,'',sh());w(2,'',sh());w(3,'',sh());nr();
+    w(0,'Страна',lb());w(1,'Тикетов',lb());w(2,'',cs(C.W));w(3,'',cs(C.W));nr();
+    cArr.slice(0,10).forEach(function(c,i){var cb=i%2===0?C.W:C.alt;w(0,c.k,cs(cb));w(1,c.v,cs(cb,C.DT,true),'n');w(2,'',cs(C.W));w(3,'',cs(C.W));nr();});
     br();
-    w(0,'В РАБОТЕ ПРЯМО СЕЙЧАС',secHdr());w(1,'',secHdr());w(2,'',secHdr());w(3,'',secHdr());nr();
-    w(0,'Ticket ID',labelS());w(1,'Country',labelS());w(2,'Взят в работу',labelS());w(3,'Висит уже',labelS());nr();
-    var nowMs=Date.now();
-    if(inProgNow.length===0){w(0,'Нет активных тикетов',cellS(C.green,C.greenFg));w(1,'',cellS(C.green));w(2,'',cellS(C.green));w(3,'',cellS(C.green));nr();}
-    else{inProgNow.forEach(function(ipr){var hang=nowMs-new Date(ipr.startDate.replace(' ','T')).getTime();var hMin=Math.floor(hang/60000);var ibg=hMin>60?C.red:hMin>30?C.yellow:C.green;var ifg=hMin>60?C.redFg:hMin>30?C.yellowFg:C.greenFg;w(0,ipr.ticketId,cellS(ibg,ifg));w(1,ipr.country,cellS(ibg,ifg));w(2,ipr.startDate,cellS(ibg,ifg));w(3,msToHMS(hang),cellS(ibg,ifg,true));nr();});}
+    w(0,'В РАБОТЕ ПРЯМО СЕЙЧАС',sh());w(1,'',sh());w(2,'',sh());w(3,'',sh());nr();
+    w(0,'Ticket ID',lb());w(1,'Country',lb());w(2,'Взят в работу',lb());w(3,'Висит уже',lb());nr();
+    var now=Date.now();
+    if(!inp.length){w(0,'Нет активных тикетов',cs(C.gB,C.gF));w(1,'',cs(C.gB));w(2,'',cs(C.gB));w(3,'',cs(C.gB));nr();}
+    else{inp.forEach(function(r){var hg=now-new Date(r.startDate.replace(' ','T')).getTime();var hm=Math.floor(hg/60000);var ib=hm>60?C.rB:hm>30?C.yB:C.gB;var if2=hm>60?C.rF:hm>30?C.yF:C.gF;w(0,r.ticketId,cs(ib,if2));w(1,r.country,cs(ib,if2));w(2,r.startDate,cs(ib,if2));w(3,msToHMS(hg),cs(ib,if2,true));nr();});}
 
-    var savedROW=ROW;ROW=0;
-    w(5,'ПЕРЕРЫВЫ (>= 5 мин)',secHdr());w(6,'',secHdr());w(7,'',secHdr());w(8,'',secHdr());nr();
-    w(5,'#',labelS());w(6,'Ticket ID',labelS());w(7,'Интервал',labelS());w(8,'Оценка',labelS());nr();
-    if(topIntervals.length===0){w(5,'Нет перерывов >= 5 мин',cellS(C.grey));w(6,'',cellS(C.grey));w(7,'',cellS(C.grey));w(8,'',cellS(C.grey));nr();}
-    else{topIntervals.forEach(function(intv,ti){var iMin=Math.floor(intv.ms/60000);var tbg=iMin<=INTERVAL_GREEN?C.green:iMin<=INTERVAL_YELLOW?C.yellow:C.red;var tfg=iMin<=INTERVAL_GREEN?C.greenFg:iMin<=INTERVAL_YELLOW?C.yellowFg:C.redFg;var assess=iMin<=INTERVAL_GREEN?'Норма':iMin<=INTERVAL_YELLOW?'Внимание':'Нарушение';w(5,ti+1,cellS(tbg,tfg,true),'n');w(6,intv.ticket,cellS(tbg,tfg));w(7,msToHMS(intv.ms),cellS(tbg,tfg,true));w(8,assess,cellS(tbg,tfg,true));nr();});}
-    w(5,'Суммарно (все)',labelS());w(6,'',cellS(C.white));
-    w(7,sumIntv.hms,valS(breakExceeded?C.red:C.green,breakExceeded?C.redFg:C.greenFg));
-    w(8,breakExceeded?'ПРЕВЫШЕН':'В норме',valS(breakExceeded?C.red:C.green,breakExceeded?C.redFg:C.greenFg));
-    ROW=Math.max(ROW,savedROW);
+    var sv=ROW;ROW=0;
+    w(5,'ПЕРЕРЫВЫ (>= 5 мин)',sh());w(6,'',sh());w(7,'',sh());w(8,'',sh());nr();
+    w(5,'#',lb());w(6,'Ticket ID',lb());w(7,'Интервал',lb());w(8,'Оценка',lb());nr();
+    if(!topI.length){w(5,'Нет перерывов >= 5 мин',cs(C.grB));w(6,'',cs(C.grB));w(7,'',cs(C.grB));w(8,'',cs(C.grB));nr();}
+    else{topI.forEach(function(x,ti){var xm=Math.floor(x.ms/60000);var tb=xm<=INTERVAL_GREEN?C.gB:xm<=INTERVAL_YELLOW?C.yB:C.rB;var tf=xm<=INTERVAL_GREEN?C.gF:xm<=INTERVAL_YELLOW?C.yF:C.rF;var ax=xm<=INTERVAL_GREEN?'Норма':xm<=INTERVAL_YELLOW?'Внимание':'Нарушение';w(5,ti+1,cs(tb,tf,true),'n');w(6,x.ticket,cs(tb,tf));w(7,msToHMS(x.ms),cs(tb,tf,true));w(8,ax,cs(tb,tf,true));nr();});}
+    w(5,'Суммарно (все)',lb());w(6,'',cs(C.W));
+    w(7,si.hms,vl(bex?C.rB:C.gB,bex?C.rF:C.gF));
+    w(8,bex?'ПРЕВЫШЕН':'В норме',vl(bex?C.rB:C.gB,bex?C.rF:C.gF));
+    ROW=Math.max(ROW,sv);
 
     ws['!ref']=XLSX.utils.encode_range({s:{r:0,c:0},e:{r:ROW+5,c:8}});
     ws['!cols']=[{wch:28},{wch:32},{wch:16},{wch:22},{wch:3},{wch:6},{wch:16},{wch:14},{wch:14}];
-    var rowsArr=[];for(var ri=0;ri<=ROW+5;ri++)rowsArr.push({hpt:20});
-    ws['!rows']=rowsArr;
+    var ra=[];for(var ri=0;ri<=ROW+5;ri++)ra.push({hpt:20});
+    ws['!rows']=ra;
     XLSX.utils.book_append_sheet(wb,ws,'Dashboard');
 
-    var filename='report_'+state.agentLogin+'_'+new Date().toISOString().slice(0,10)+'.xlsx';
-    XLSX.writeFile(wb,filename);
-    document.getElementById('tm-btn-start').disabled=false;
+    var fn='report_'+state.agentLogin+'_'+new Date().toISOString().slice(0,10)+'.xlsx';
+    XLSX.writeFile(wb,fn);
+    document.getElementById('tmstart').disabled=false;
     setProgress(state.done,state.done);
-    setStatus('✅ Скачан: '+filename+' | Записей: '+state.results.length);
-    console.log('XLSX скачан: '+filename);
+    setStatus('✅ '+fn+' | Записей: '+state.results.length+(state.skipped?' | ⚠ пропущено: '+state.skipped:''));
   }
 
 })();
